@@ -1,0 +1,30 @@
+pkgname=stremio-downmix-bin
+pkgver=4.4.183
+pkgrel=3
+pkgdesc="Stremio desktop client with multichannel dialogue downmixing (prebuilt)"
+arch=('x86_64')
+url="https://github.com/jimzrt/stremio-shell"
+license=('MIT')
+depends=('nodejs' 'ffmpeg' 'libvpx1.15' 'qt5-webengine' 'qt5-webchannel' 'qt5-declarative' 'qt5-quickcontrols' 'qt5-quickcontrols2' 'qt5-translations' 'mpv' 'openssl')
+provides=('stremio')
+conflicts=('stremio' 'stremio-git' 'stremio-legacy' 'stremio-beta' 'stremio-downmix-git')
+source=("https://github.com/jimzrt/stremio-shell/releases/download/downmix-${pkgver}/stremio-shell-${pkgver}-x86_64.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+    local install_dir="${pkgdir}/opt/stremio-downmix-bin"
+    install -Dm755 stremio "${install_dir}/stremio"
+    install -d "${pkgdir}/usr/bin"
+    ln -s /opt/stremio-downmix-bin/stremio "${pkgdir}/usr/bin/stremio"
+    install -Dm644 server.js "${install_dir}/server.js"
+    install -Dm644 smartcode-stremio.desktop \
+        "${pkgdir}/usr/share/applications/stremio-downmix.desktop"
+    cp -a icons "${install_dir}/"
+    ln -s /usr/bin/node "${install_dir}/node"
+    sed -i 's/^Icon=.*/Icon=stremio-downmix/' \
+        "${pkgdir}/usr/share/applications/stremio-downmix.desktop"
+    install -Dm644 icons/smartcode-stremio_128.png \
+        "${pkgdir}/usr/share/icons/hicolor/128x128/apps/stremio-downmix.png"
+    install -Dm644 icons/smartcode-stremio_64.png \
+        "${pkgdir}/usr/share/icons/hicolor/64x64/apps/stremio-downmix.png"
+}

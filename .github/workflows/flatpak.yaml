@@ -1,71 +1,82 @@
-name: Flatpak
+name: Flatpak downmix release
 
 on:
-  push:
-  pull_request:
-  schedule:
-    - cron: '45 21 * * *'
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: Release version name
+        required: false
+        default: "4.4.183"
+
+permissions:
+  contents: write
+
+env:
+  VERSION_NAME: ${{ inputs.version_name }}
+
 jobs:
   build:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest]
-    env:
-      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    name: Build and publish Flatpak
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
         with:
-          submodules: true
+          ref: feature/downmix
+          submodules: recursive
 
-      - name: Submodules
-        run: git submodule update --init --recursive
+      - name: Add deployment metadata
+        run: |
+          git fetch --no-tags origin feature/downmix-aur
+          git show FETCH_HEAD:flatpak/assets/com.stremio.Stremio.appdata.xml > flatpak/assets/com.stremio.Stremio.appdata.xml
 
-      - name: Install flatpak
+      - name: Install Flatpak tooling
         run: |
           sudo apt-get update
-          sudo apt-get -y install flatpak-builder
+          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder elfutils
           sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
 
-      - name: Prepare environment
+      - name: Build Flatpak
         run: |
-          SHELL_VERSION=$(git grep -hoP '^\s*VERSION\s*=\s*\K.*$' HEAD -- stremio.pro)
-          FLATPAK_PATH="Stremio $SHELL_VERSION.flatpak"
-          node -e 'process.stdout.write("CURRENT_BRANCH="+process.env.GITHUB_REF.replace(/^refs\/(heads|tags)\//, "")+"\n")' >> $GITHUB_ENV
-          echo SHELL_VERSION=$SHELL_VERSION >> $GITHUB_ENV
-          echo FLATPAK_PATH=$FLATPAK_PATH >> $GITHUB_ENV
-          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then echo DEPLOY=false >> $GITHUB_ENV; else echo DEPLOY=true >> $GITHUB_ENV; fi
+          set -euo pipefail
+          sudo flatpak-builder \
+            --repo=stremio-flatpak-repo \
+            --install-deps-from=flathub \
+            --force-clean \
+            _build com.stremio.Stremio.json
 
-      - name: Build
-        run: sudo flatpak-builder --repo=stremio-flatpak-repo --install-deps-from=flathub --force-clean _build com.stremio.Stremio.json
-
-      - name: Pack
+      - name: Pack Flatpak
         run: |
-          flatpak build-bundle stremio-flatpak-repo Stremio.flatpak com.stremio.Stremio beta
-          mv Stremio.flatpak "$FLATPAK_PATH"
+          set -euo pipefail
+          flatpak build-bundle \
+            stremio-flatpak-repo \
+            "Stremio-${VERSION_NAME}.flatpak" \
+            com.stremio.Stremio beta
+          sha256sum "Stremio-${VERSION_NAME}.flatpak" > "Stremio-${VERSION_NAME}-SHA256SUMS.txt"
 
-      - name: Store the Flatpak
-        uses: actions/upload-artifact@v1
+      - name: Store Flatpak artifact
+        uses: actions/upload-artifact@v4
         with:
           name: StremioFlatpak
-          path: ${{ env.FLATPAK_PATH }}
+          path: |
+            Stremio-${{ env.VERSION_NAME }}.flatpak
+            Stremio-${{ env.VERSION_NAME }}-SHA256SUMS.txt
 
-      - name: Upload to AWS
-        shell: bash
+      - name: Publish release assets
         env:
-          AWS_ACCESS_KEY_ID: AKIAJWBFLU34IVITPLHA
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET }}
-          AWS_DEFAULT_REGION: eu-west-1
+          GH_TOKEN: ${{ github.token }}
         run: |
-          sudo pip3 install s3cmd
-          if [ "$DEPLOY" = "true" ]; then s3cmd --acl-public --access_key=$AWS_ACCESS_KEY_ID --secret_key=$AWS_SECRET_ACCESS_KEY --force --region=$AWS_DEFAULT_REGION put "$FLATPAK_PATH" s3://stremio-artifacts/shell-linux/$CURRENT_BRANCH/; fi
-
-      - name: Notify Slack channel
-        uses: rtCamp/action-slack-notify@master
-        env:
-          SLACK_USERNAME: Github Action
-          SLACK_ICON: https://s3-us-west-2.amazonaws.com/slack-files2/bot_icons/2020-10-19/1422366829703_48.png
-          SLACK_TITLE: Github Builds - Flatpak
-          SLACK_CHANNEL: '#installer-ci'
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
-        if: ${{ !github.event.pull_request }}
+          set -euo pipefail
+          tag="downmix-${VERSION_NAME}"
+          if ! gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "${tag}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target feature/downmix \
+              --title "Stremio downmix ${VERSION_NAME}" \
+              --notes "Flatpak bundle for the UI-selectable dialogue downmix feature."
+          fi
+          gh release upload "${tag}" \
+            "Stremio-${VERSION_NAME}.flatpak" \
+            "Stremio-${VERSION_NAME}-SHA256SUMS.txt" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber

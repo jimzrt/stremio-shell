@@ -1,0 +1,70 @@
+name: Downmix Linux binary release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: Release version name
+        required: false
+        default: "4.4.183"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish Linux binary
+    runs-on: ubuntu-22.04
+    env:
+      VERSION_NAME: ${{ inputs.version_name }}
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: feature/downmix
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake librsvg2-bin nodejs wget patchelf \
+            libmpv-dev libssl-dev qtbase5-dev qtdeclarative5-dev \
+            qtquickcontrols2-5-dev qtwebengine5-dev libqt5webchannel5-dev \
+            libqt5opengl5-dev
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          make -f release.makefile server.js icons
+          cmake -G"Unix Makefiles" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="" \
+            -DCMAKE_PREFIX_PATH=/usr/lib/x86_64-linux-gnu/cmake \
+            -B build -S .
+          make --no-print-directory -C build
+          patchelf --replace-needed libmpv.so.1 libmpv.so.2 build/stremio
+      - name: Package binary asset
+        run: |
+          set -euo pipefail
+          mkdir -p dist/stremio-downmix
+          cp build/stremio server.js smartcode-stremio.desktop dist/stremio-downmix/
+          cp -a icons dist/stremio-downmix/
+          tar -C dist/stremio-downmix -czf "dist/stremio-shell-${VERSION_NAME}-x86_64.tar.gz" .
+          rm -rf dist/stremio-downmix
+          (cd dist && sha256sum "stremio-shell-${VERSION_NAME}-x86_64.tar.gz" > SHA256SUMS.txt)
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="downmix-${VERSION_NAME}"
+          if ! gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "${tag}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target feature/downmix \
+              --title "Stremio downmix ${VERSION_NAME}" \
+              --notes "Linux x86_64 binary for the UI-selectable dialogue downmix feature."
+          fi
+          gh release upload "${tag}" dist/* --repo "${GITHUB_REPOSITORY}" --clobber
