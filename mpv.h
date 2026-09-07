@@ -3,6 +3,7 @@
 #define MPV_ENABLE_DEPRECATED 0
 
 #include <QtQuick/QQuickFramebufferObject>
+#include <QHash>
 
 #include <mpv/client.h>
 #include <mpv/render_gl.h>
@@ -16,6 +17,8 @@ class MpvObject : public QQuickFramebufferObject
 
     mpv_handle *mpv;
     mpv_render_context *mpv_gl;
+    QHash<qint64, qint64> dialogue_downmix_tracks;
+    qint64 active_dialogue_downmix_track;
 
     friend class MpvRenderer;
 

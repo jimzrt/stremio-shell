@@ -40,6 +40,13 @@ static void *get_proc_address_mpv(void *ctx, const char *name)
 
 } // namespace
 
+static const char *dialogue_downmix_filter =
+    "lavfi=[pan=stereo|"
+    "FL=0.50*FL+0.85*FC+0.20*LFE+0.35*BL+0.35*SL|"
+    "FR=0.50*FR+0.85*FC+0.20*LFE+0.35*BR+0.35*SR,"
+    "acompressor=threshold=0.125:ratio=3:attack=20:release=250:makeup=1.5,"
+    "alimiter=limit=0.95:level=0]";
+
 
 class MpvRenderer : public QQuickFramebufferObject::Renderer
 {
@@ -105,7 +112,8 @@ class MpvRenderer : public QQuickFramebufferObject::Renderer
 };
 
 MpvObject::MpvObject(QQuickItem * parent)
-    : QQuickFramebufferObject(parent), mpv{mpv_create()}, mpv_gl(nullptr)
+    : QQuickFramebufferObject(parent), mpv{mpv_create()}, mpv_gl(nullptr),
+      active_dialogue_downmix_track{0}
 {
 #ifdef Q_OS_WIN32
   // Request Multimedia Class Schedule Service.
@@ -142,6 +150,12 @@ void MpvObject::initialize_mpv() {
     // terminal=yes brings us all the terminal logs; on windows it's much better with winpty (https://github.com/mpv-player/mpv/blob/master/DOCS/compile-windows.md)
     mpv_set_option_string(mpv, "terminal", "yes");
     mpv_set_option_string(mpv, "msg-level", "all=v");
+
+    // Keep the decoder's native layout available to the filter and let mpv
+    // produce stereo for both ordinary and synthetic tracks.
+    mpv_set_option_string(mpv, "audio-channels", "stereo");
+    mpv_set_option_string(mpv, "ad-lavc-downmix", "no");
+
 
     if (mpv_initialize(mpv) < 0)
         throw std::runtime_error("could not initialize mpv context");
@@ -200,6 +214,22 @@ void MpvObject::command(const QVariant& params)
 
 void MpvObject::setProperty(const QString& name, const QVariant& value)
 {
+    if (name == "aid") {
+        const qint64 requested_id = value.toLongLong();
+        if (dialogue_downmix_tracks.contains(requested_id)) {
+            active_dialogue_downmix_track = requested_id;
+            mpv_set_property_string(mpv, "af", dialogue_downmix_filter);
+            mpv::qt::set_property(
+                mpv, "aid", dialogue_downmix_tracks.value(requested_id));
+            return;
+        }
+
+        if (active_dialogue_downmix_track) {
+            active_dialogue_downmix_track = 0;
+            mpv_set_property_string(mpv, "af", "");
+        }
+    }
+
     mpv::qt::set_property(mpv, name, value);
 }
 
@@ -245,12 +275,54 @@ void MpvObject::handle_mpv_event(mpv_event *event) {
 
             // NOTE: because we always observe as node, we can handle only that case; we are handling the others, to be safe :)
             switch (prop->format) {
-            case MPV_FORMAT_NODE:
+            case MPV_FORMAT_NODE: {
                 // Show the player only if there is a video stream
                 if(((mpv_node *)prop->data)->format == MPV_FORMAT_INT64 && eventJson["name"] == "vid")
                     this->setVisible(true);
-                eventJson["data"] = QJsonValue::fromVariant(mpv::qt::node_to_variant((mpv_node *) prop->data));
+
+                QVariant data = mpv::qt::node_to_variant((mpv_node *) prop->data);
+                if (eventJson["name"] == "track-list") {
+                    QVariantList exposed_tracks;
+                    dialogue_downmix_tracks.clear();
+
+                    for (const QVariant &value : data.toList()) {
+                        QVariantMap track = value.toMap();
+                        exposed_tracks.append(track);
+
+                        if (track.value("type").toString() != "audio" ||
+                            track.value("audio-channels").toLongLong() <= 2)
+                            continue;
+
+                        const qint64 source_id = track.value("id").toLongLong();
+                        if (source_id <= 0)
+                            continue;
+
+                        const qint64 downmix_id = -source_id;
+                        dialogue_downmix_tracks.insert(downmix_id, source_id);
+
+                        QVariantMap downmix = track;
+                        downmix["id"] = downmix_id;
+                        downmix["audio-channels"] = 2;
+                        const QString source_title = track.value("title").toString();
+                        const QString source_lang = track.value("lang").toString();
+                        downmix["title"] = source_title.isEmpty()
+                            ? QStringLiteral("Downmixed")
+                            : source_title + QStringLiteral(" (Downmixed)");
+                        downmix["lang"] = source_lang.isEmpty()
+                            ? QStringLiteral("Downmixed")
+                            : source_lang + QStringLiteral(" (Downmixed)");
+                        exposed_tracks.append(downmix);
+                    }
+                    data = exposed_tracks;
+                } else if (eventJson["name"] == "aid" &&
+                           active_dialogue_downmix_track) {
+                    const qint64 source_id = data.toLongLong();
+                    if (dialogue_downmix_tracks.value(active_dialogue_downmix_track) == source_id)
+                        data = active_dialogue_downmix_track;
+                }
+                eventJson["data"] = QJsonValue::fromVariant(data);
                 break;
+            }
             case MPV_FORMAT_DOUBLE:
                 eventJson["data"] = *(double *)prop->data;
                 break;
@@ -260,7 +332,7 @@ void MpvObject::handle_mpv_event(mpv_event *event) {
             case MPV_FORMAT_STRING:
                 eventJson["data"] = QString(*(char **)prop->data);
                 break;
-            default: 
+            default:
                 break;
             }
 
