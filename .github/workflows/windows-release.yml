@@ -114,11 +114,15 @@ jobs:
             Stop-Process $server.Id -Force -ErrorAction SilentlyContinue
           }
 
-      - name: Build installer
+      - name: Build unsigned installer
         shell: pwsh
         run: |
           $env:package_version = $env:VERSION_NAME
-          makensis -V2 .\windows\installer\windows-installer.nsi
+          $installer = '.\windows\installer\windows-installer-release.nsi'
+          (Get-Content .\windows\installer\windows-installer.nsi) |
+            Where-Object { $_ -notmatch '!uninstfinalize' } |
+            Set-Content $installer
+          makensis -V2 $installer
           Rename-Item "Stremio $env:VERSION_NAME.exe" "Stremio-$env:VERSION_NAME-windows-x86.exe"
           Compress-Archive -Path dist-win\* -DestinationPath "Stremio-$env:VERSION_NAME-windows-x86.zip"
           $assets = @(
