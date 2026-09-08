@@ -1,0 +1,126 @@
+name: Downmix macOS release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: Release version name
+        required: false
+        default: "4.4.183"
+
+permissions:
+  contents: write
+
+env:
+  VERSION_NAME: ${{ inputs.version_name }}
+
+jobs:
+  release:
+    name: Build and publish macOS package
+    runs-on: macos-14
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: feature/downmix
+          submodules: recursive
+
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '15'
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: 5.15.2
+          modules: qtwebengine qtwebglplugin
+
+      - name: Install packaging tools
+        run: npm install --global appdmg
+
+      - name: Build shell
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/iina/iina.git
+          sed -i '' 's/ARCH="universal"/ARCH="x86_64"/g' iina/other/download_libs.sh
+          sed -i '' 's|DYLIBS_DOWNLOAD_PATH="https://iina.io/dylibs/${ARCH}"|DYLIBS_DOWNLOAD_PATH="https://iina.io/dylibs/1.3.2/${ARCH}"|' iina/other/download_libs.sh
+          bash iina/other/download_libs.sh
+          export MPV_BIN_PATH="$(pwd)/iina/deps"
+          ln -s libmpv.2.dylib "$MPV_BIN_PATH/lib/libmpv.dylib"
+          mkdir build
+          (
+            cd build
+            cmake \
+              -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DOPENSSL_CRYPTO_LIBRARY="$(pwd)/../mac/libcrypto.3.dylib" \
+              -DCMAKE_RULE_MESSAGES:BOOL=OFF \
+              -DCMAKE_VERBOSE_MAKEFILE=ON \
+              ..
+            make --no-print-directory
+          )
+
+      - name: Assemble application bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          dest_dir="build/stremio.app/Contents/MacOS"
+          mkdir -p "$dest_dir"
+          cp mac/ffmpeg mac/ffprobe "$dest_dir/"
+          unzip -o mac/node.zip -d "$dest_dir"
+          chmod +wx "$dest_dir/ffmpeg" "$dest_dir/ffprobe" "$dest_dir/node"
+          macdeployqt build/stremio.app \
+            -executable="$dest_dir/ffmpeg" \
+            -executable="$dest_dir/ffprobe" \
+            -executable="$dest_dir/node"
+          curl -fsSL "$(cat server-url.txt)" -o "$dest_dir/server.js"
+          cp iina/deps/lib/* build/stremio.app/Contents/Frameworks/
+          cp mac/libcrypto.3.dylib build/stremio.app/Contents/Frameworks/
+          test -x build/stremio.app/Contents/MacOS/stremio
+
+      - name: Package unsigned artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mv build/stremio.app Stremio.app
+          ditto -c -k --rsrc --keepParent Stremio.app \
+            "Stremio-${VERSION_NAME}-macos-x86_64.app.zip"
+          sed "s/\"title\": \"Stremio.*\"/\"title\": \"Stremio ${VERSION_NAME}\"/" \
+            mac/appdmg.json > mac/appdmg-release.json
+          appdmg mac/appdmg-release.json "Stremio-${VERSION_NAME}-macos-x86_64.dmg"
+          rm mac/appdmg-release.json
+          shasum -a 256 \
+            "Stremio-${VERSION_NAME}-macos-x86_64.app.zip" \
+            "Stremio-${VERSION_NAME}-macos-x86_64.dmg" \
+            > "Stremio-${VERSION_NAME}-macos-x86_64-SHA256SUMS.txt"
+
+      - name: Store macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: StremioMacOS
+          path: |
+            Stremio-${{ env.VERSION_NAME }}-macos-x86_64.app.zip
+            Stremio-${{ env.VERSION_NAME }}-macos-x86_64.dmg
+            Stremio-${{ env.VERSION_NAME }}-macos-x86_64-SHA256SUMS.txt
+
+      - name: Publish release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="downmix-${VERSION_NAME}"
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target feature/downmix \
+              --title "Stremio downmix ${VERSION_NAME}" \
+              --notes "macOS x86_64 package for the UI-selectable dialogue downmix feature."
+          fi
+          gh release upload "$tag" \
+            "Stremio-${VERSION_NAME}-macos-x86_64.app.zip" \
+            "Stremio-${VERSION_NAME}-macos-x86_64.dmg" \
+            "Stremio-${VERSION_NAME}-macos-x86_64-SHA256SUMS.txt" \
+            --repo "$GITHUB_REPOSITORY" --clobber

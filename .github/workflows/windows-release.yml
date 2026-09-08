@@ -1,0 +1,161 @@
+name: Downmix Windows release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: Release version name
+        required: false
+        default: "4.4.183"
+
+permissions:
+  contents: write
+
+env:
+  VERSION_NAME: ${{ inputs.version_name }}
+
+jobs:
+  release:
+    name: Build and publish Windows package
+    runs-on: windows-2022
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: feature/downmix
+          submodules: recursive
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: 5.15.2
+          arch: win32_msvc2019
+          modules: qtwebengine qtwebglplugin
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Install build tools
+        shell: pwsh
+        run: choco install nsis -y --no-progress
+
+      - name: Install NSIS process plugin
+        shell: pwsh
+        run: |
+          $nsisDir = "${env:ProgramFiles(x86)}\NSIS"
+          if (-not (Test-Path "$nsisDir\makensis.exe")) { throw "NSIS was not installed" }
+          "$nsisDir" | Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+          Copy-Item windows\NsProcess\Include\nsProcess.nsh "$nsisDir\Include\"
+          Copy-Item windows\NsProcess\Plugin\x86-ansi\nsProcess.dll "$nsisDir\Plugins\x86-ansi\"
+          Copy-Item windows\NsProcess\Plugin\x86-unicode\nsProcess.dll "$nsisDir\Plugins\x86-unicode\"
+
+      - name: Install OpenSSL
+        shell: pwsh
+        run: |
+          $hashes = Invoke-RestMethod 'https://raw.githubusercontent.com/slproweb/opensslhashes/master/win32_openssl_hashes.json'
+          $file = $hashes.files.psobject.properties.name |
+            Where-Object { $_.StartsWith('Win32OpenSSL-1_1_1') -and $_.EndsWith('.exe') } |
+            Select-Object -First 1
+          if (-not $file) { throw 'Could not find a Win32 OpenSSL installer' }
+          Invoke-WebRequest $hashes.files.$file.url -OutFile $file
+          if ((Get-FileHash $file -Algorithm SHA256).Hash -ne $hashes.files.$file.sha256) {
+            throw 'OpenSSL checksum does not match'
+          }
+          Start-Process .\$file -ArgumentList '/silent /verysilent /sp- /suppressmsgboxes /dir=C:\OpenSSL-Win32' -Wait
+          Remove-Item $file
+          "OPENSSL_ROOT_DIR=C:\OpenSSL-Win32" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build shell
+        shell: pwsh
+        run: |
+          cmake -G "Visual Studio 17 2022" -A Win32 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DOPENSSL_ROOT_DIR="$env:OPENSSL_ROOT_DIR" `
+            -B build -S .
+          cmake --build build --config Release --parallel
+
+      - name: Assemble portable package
+        shell: pwsh
+        run: |
+          $dist = Join-Path $PWD 'dist-win'
+          New-Item -ItemType Directory -Force $dist | Out-Null
+          Copy-Item build\Release\stremio.exe $dist
+          Copy-Item windows\*.dll $dist
+          Copy-Item windows\*.exe $dist
+          Copy-Item windows\DS\* $dist
+          Copy-Item C:\OpenSSL-Win32\bin\*.dll $dist
+
+          $nodeZip = Join-Path $env:RUNNER_TEMP 'node-x86.zip'
+          $nodeDir = Join-Path $env:RUNNER_TEMP 'node-x86'
+          Invoke-WebRequest 'https://nodejs.org/dist/v14.15.0/node-v14.15.0-win-x86.zip' -OutFile $nodeZip
+          Expand-Archive $nodeZip -DestinationPath $nodeDir -Force
+          Copy-Item (Join-Path $nodeDir 'node-v14.15.0-win-x86\node.exe') (Join-Path $dist 'stremio-runtime.exe')
+
+          $serverUrl = (Get-Content server-url.txt -Raw).Trim()
+          $serverPath = Join-Path $dist 'server.js'
+          Invoke-WebRequest $serverUrl -OutFile $serverPath
+          (Get-Content $serverPath -Raw).Replace('os.tmpDir', 'os.tmpdir') |
+            Set-Content $serverPath -NoNewline
+
+          windeployqt --release --no-compiler-runtime --qmldir=. (Join-Path $dist 'stremio.exe')
+
+      - name: Smoke-test server
+        shell: pwsh
+        run: |
+          $server = Start-Process (Join-Path $PWD 'dist-win\stremio-runtime.exe') `
+            -ArgumentList (Join-Path $PWD 'dist-win\server.js') -PassThru -WindowStyle Hidden
+          try {
+            Start-Sleep -Seconds 8
+            $response = Invoke-WebRequest 'http://127.0.0.1:11470/stats.json'
+            if ($response.StatusCode -ne 200) { throw "Unexpected server status: $($response.StatusCode)" }
+          } finally {
+            Stop-Process $server.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $env:package_version = $env:VERSION_NAME
+          makensis -V2 .\windows\installer\windows-installer.nsi
+          Rename-Item "Stremio $env:VERSION_NAME.exe" "Stremio-$env:VERSION_NAME-windows-x86.exe"
+          Compress-Archive -Path dist-win\* -DestinationPath "Stremio-$env:VERSION_NAME-windows-x86.zip"
+          $assets = @(
+            "Stremio-$env:VERSION_NAME-windows-x86.exe",
+            "Stremio-$env:VERSION_NAME-windows-x86.zip"
+          )
+          $checksums = $assets | ForEach-Object {
+            $hash = (Get-FileHash $_ -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $_"
+          }
+          $checksums | Set-Content "Stremio-$env:VERSION_NAME-windows-x86-SHA256SUMS.txt"
+
+      - name: Store Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: StremioWindows
+          path: |
+            Stremio-${{ env.VERSION_NAME }}-windows-x86.exe
+            Stremio-${{ env.VERSION_NAME }}-windows-x86.zip
+            Stremio-${{ env.VERSION_NAME }}-windows-x86-SHA256SUMS.txt
+
+      - name: Publish release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "downmix-$env:VERSION_NAME"
+          gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag `
+              --repo $env:GITHUB_REPOSITORY `
+              --target feature/downmix `
+              --title "Stremio downmix $env:VERSION_NAME" `
+              --notes 'Windows package for the UI-selectable dialogue downmix feature.'
+          }
+          gh release upload $tag `
+            "Stremio-$env:VERSION_NAME-windows-x86.exe" `
+            "Stremio-$env:VERSION_NAME-windows-x86.zip" `
+            "Stremio-$env:VERSION_NAME-windows-x86-SHA256SUMS.txt" `
+            --repo $env:GITHUB_REPOSITORY --clobber
