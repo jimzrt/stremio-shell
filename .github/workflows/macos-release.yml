@@ -67,7 +67,7 @@ jobs:
         run: |
           set -euo pipefail
           dest_dir="build/stremio.app/Contents/MacOS"
-          mkdir -p "$dest_dir"
+          mkdir -p "$dest_dir" build/stremio.app/Contents/Frameworks
           cp mac/ffmpeg mac/ffprobe "$dest_dir/"
           unzip -o mac/node.zip -d "$dest_dir"
           chmod +wx "$dest_dir/ffmpeg" "$dest_dir/ffprobe" "$dest_dir/node"
